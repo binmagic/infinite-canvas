@@ -245,6 +245,27 @@ return (data.candidates || [])
   .filter(Boolean)
   .map((img) => \`data:\${img.mimeType || img.mime_type || "image/png"};base64,\${img.data}\`);`,
         },
+        {
+            label: "DashScope (Qwen/Z-Image)",
+            script: `// ${i18n.t("modelPlugin.templates.imageDashscope")}
+// ${i18n.t("modelPlugin.templates.availableImageDashscope")}
+const isZImage = /^z-image/i.test(model || "");
+// params.size arrives as "WxH" (or "auto"); DashScope wants "W*H".
+const match = (params.size || "").match(/^(\\d+)x(\\d+)$/i);
+const size = match ? \`\${match[1]}*\${match[2]}\` : (isZImage ? "1280*1280" : "1024*1024");
+const content = images.length > 0 ? [{ image: images[0] }, { text: prompt }] : [{ text: prompt }];
+const parameters = isZImage ? { size, prompt_extend: false } : { size, n: params.count };
+const data = await request({
+  method: "post",
+  url: \`\${baseUrl}/services/aigc/multimodal-generation/generation\`,
+  headers: { "Content-Type": "application/json", Authorization: \`Bearer \${apiKey}\` },
+  data: { model, input: { messages: [{ role: "user", content }] }, parameters },
+});
+const responseContent = data?.output?.choices?.[0]?.message?.content;
+const images_ = Array.isArray(responseContent) ? responseContent.filter((part) => part?.image).map((part) => part.image) : [];
+if (!images_.length) throw new Error(data?.message || "DashScope returned no image.");
+return images_;`,
+        },
     ],
     video: [
         {
