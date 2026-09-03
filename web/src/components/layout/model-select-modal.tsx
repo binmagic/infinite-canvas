@@ -4,14 +4,31 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { fetchChannelModels } from "@/services/api/image";
-import type { ModelChannel } from "@/stores/use-config-store";
+import type { ModelCapability, ModelChannel } from "@/stores/use-config-store";
+
+export type ModelSelectionResult = { name: string; capability?: ModelCapability };
 
 // Channel model selector: fetch upstream models or add them manually, then include checked models in the channel list.
-export function ModelSelectModal({ open, channel, selectedNames, onConfirm, onClose }: { open: boolean; channel: ModelChannel | null; selectedNames: string[]; onConfirm: (names: string[]) => void; onClose: () => void }) {
+// Fetched models may carry a capability inferred from real provider metadata (e.g. Gemini's
+// supportedGenerationMethods or an OpenRouter-style architecture.output_modalities field) rather
+// than a name-based guess; that hint is passed back via onConfirm so the caller can prefill it.
+export function ModelSelectModal({
+    open,
+    channel,
+    selectedNames,
+    onConfirm,
+    onClose,
+}: {
+    open: boolean;
+    channel: ModelChannel | null;
+    selectedNames: string[];
+    onConfirm: (selections: ModelSelectionResult[]) => void;
+    onClose: () => void;
+}) {
     const { message } = App.useApp();
     const { t } = useTranslation();
     const [existing, setExisting] = useState<string[]>([]);
-    const [fetched, setFetched] = useState<string[]>([]);
+    const [fetched, setFetched] = useState<ModelSelectionResult[]>([]);
     const [selected, setSelected] = useState<Set<string>>(new Set());
     const [activeTab, setActiveTab] = useState("new");
     const [search, setSearch] = useState("");
@@ -28,12 +45,14 @@ export function ModelSelectModal({ open, channel, selectedNames, onConfirm, onCl
         setManual("");
     }, [open, selectedNames]);
 
-    const currentList = activeTab === "new" ? fetched : existing;
+    const fetchedNames = useMemo(() => fetched.map((model) => model.name), [fetched]);
+    const currentList = activeTab === "new" ? fetchedNames : existing;
     const visibleList = useMemo(() => {
         const keyword = search.trim().toLowerCase();
         return keyword ? currentList.filter((name) => name.toLowerCase().includes(keyword)) : currentList;
     }, [currentList, search]);
     const visibleSelectedCount = visibleList.filter((name) => selected.has(name)).length;
+    const capabilityByName = useMemo(() => new Map(fetched.map((model) => [model.name, model.capability])), [fetched]);
 
     const toggle = (name: string, checked: boolean) =>
         setSelected((current) => {
@@ -53,7 +72,7 @@ export function ModelSelectModal({ open, channel, selectedNames, onConfirm, onCl
     const addManual = () => {
         const name = manual.trim();
         if (!name) return;
-        if (!fetched.includes(name) && !existing.includes(name)) setFetched((current) => [name, ...current]);
+        if (!fetchedNames.includes(name) && !existing.includes(name)) setFetched((current) => [{ name }, ...current]);
         setSelected((current) => new Set(current).add(name));
         setManual("");
         setActiveTab("new");
@@ -79,8 +98,8 @@ export function ModelSelectModal({ open, channel, selectedNames, onConfirm, onCl
     };
 
     const confirm = () => {
-        const ordered = [...existing, ...fetched].filter((name, index, list) => list.indexOf(name) === index).filter((name) => selected.has(name));
-        onConfirm(ordered);
+        const ordered = [...existing, ...fetchedNames].filter((name, index, list) => list.indexOf(name) === index).filter((name) => selected.has(name));
+        onConfirm(ordered.map((name) => ({ name, capability: capabilityByName.get(name) })));
         onClose();
     };
 
@@ -92,7 +111,7 @@ export function ModelSelectModal({ open, channel, selectedNames, onConfirm, onCl
             onCancel={onClose}
             title={
                 <span>
-                    {t("config.modelSelect.title")} <span className="ml-2 text-xs font-normal text-stone-500">{t("config.modelSelect.selected", { selected: selected.size, total: new Set([...existing, ...fetched]).size })}</span>
+                    {t("config.modelSelect.title")} <span className="ml-2 text-xs font-normal text-stone-500">{t("config.modelSelect.selected", { selected: selected.size, total: new Set([...existing, ...fetchedNames]).size })}</span>
                 </span>
             }
             styles={{ body: { maxHeight: "62vh", overflowY: "auto" } }}
@@ -120,7 +139,7 @@ export function ModelSelectModal({ open, channel, selectedNames, onConfirm, onCl
                 activeKey={activeTab}
                 onChange={setActiveTab}
                 items={[
-                    { key: "new", label: t("config.modelSelect.fetchedTab", { count: fetched.length }) },
+                    { key: "new", label: t("config.modelSelect.fetchedTab", { count: fetchedNames.length }) },
                     { key: "existing", label: t("config.modelSelect.existingTab", { count: existing.length }) },
                 ]}
             />
@@ -139,13 +158,21 @@ export function ModelSelectModal({ open, channel, selectedNames, onConfirm, onCl
 
             {visibleList.length ? (
                 <div className="grid grid-cols-1 gap-x-8 gap-y-3 md:grid-cols-2">
-                    {visibleList.map((name) => (
-                        <Checkbox key={name} checked={selected.has(name)} onChange={(event) => toggle(name, event.target.checked)}>
-                            <span className="truncate" title={name}>
-                                {name}
-                            </span>
-                        </Checkbox>
-                    ))}
+                    {visibleList.map((name) => {
+                        const capability = capabilityByName.get(name);
+                        return (
+                            <Checkbox key={name} checked={selected.has(name)} onChange={(event) => toggle(name, event.target.checked)}>
+                                <span className="truncate" title={name}>
+                                    {name}
+                                </span>
+                                {capability ? (
+                                    <span className="ml-2 rounded px-1.5 py-0.5 text-[10px] text-stone-500 ring-1 ring-inset ring-stone-300 dark:text-stone-400 dark:ring-stone-700">
+                                        {t(`config.channelEditor.capabilities.${capability}`)}
+                                    </span>
+                                ) : null}
+                            </Checkbox>
+                        );
+                    })}
                 </div>
             ) : (
                 <div className="py-8 text-center text-sm text-stone-500">{t(activeTab === "new" ? "config.modelSelect.fetchedEmpty" : "config.modelSelect.existingEmpty")}</div>

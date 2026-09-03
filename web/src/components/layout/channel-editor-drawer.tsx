@@ -5,7 +5,7 @@ import { useTranslation } from "react-i18next";
 
 import { defaultBaseUrlForApiFormat, guessCapability, normalizeChannelModels, type ApiCallFormat, type ChannelModel, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 import { ModelScriptEditor } from "./model-script-editor";
-import { ModelSelectModal } from "./model-select-modal";
+import { ModelSelectModal, type ModelSelectionResult } from "./model-select-modal";
 
 type ScriptTarget = { name: string; capability: ModelCapability; value: string };
 
@@ -34,9 +34,12 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
         patch({ apiFormat, baseUrl });
     };
 
-    const applySelection = (names: string[]) => {
+    const applySelection = (selections: ModelSelectionResult[]) => {
         const map = new Map(draft.models.map((model) => [model.name, model]));
-        setModels(names.map((name) => map.get(name) || { name, capability: guessCapability(name) }));
+        // Prefer capability inferred from real provider metadata (Gemini's supportedGenerationMethods,
+        // or an OpenRouter-style architecture.output_modalities field); fall back to the name-based
+        // guess only when the provider didn't expose that signal.
+        setModels(selections.map(({ name, capability }) => map.get(name) || { name, capability: capability || guessCapability(name) }));
     };
 
     const setCapability = (name: string, capability: ModelCapability) => setModels(draft.models.map((model) => (model.name === name ? { ...model, capability } : model)));

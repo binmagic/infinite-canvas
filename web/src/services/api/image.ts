@@ -1,7 +1,16 @@
 import axios from "axios";
 
 import i18n from "@/i18n";
-import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import {
+    buildApiUrl,
+    capabilityFromGeminiMethods,
+    capabilityFromOutputModalities,
+    resolveModelRequestConfig,
+    resolveModelScript,
+    type AiConfig,
+    type FetchedModel,
+    type ModelChannel,
+} from "@/stores/use-config-store";
 import { normalizePluginImages, runModelPlugin } from "./model-plugin";
 import { nanoid } from "nanoid";
 import { dataUrlToFile } from "@/lib/image-utils";
@@ -89,7 +98,8 @@ type GeminiPart = {
 type GeminiContent = { role?: "user" | "model"; parts: GeminiPart[] };
 type GeminiPayload = {
     candidates?: Array<{ content?: { parts?: GeminiPart[] }; finishReason?: string }>;
-    models?: Array<{ name?: string }>;
+    models?: Array<{ name?: string; supportedGenerationMethods?: string[] }>;
+    nextPageToken?: string;
     error?: { message?: string };
     promptFeedback?: { blockReason?: string };
 };
@@ -878,25 +888,48 @@ export async function requestImageQuestion(config: AiConfig, messages: AiTextMes
     }
 }
 
-export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKey" | "apiFormat">) {
+// Gemini's ListModels endpoint paginates (nextPageToken); a hard cap avoids an infinite loop
+// if a misbehaving upstream keeps returning a token.
+const GEMINI_MODELS_PAGE_SIZE = 200;
+const GEMINI_MODELS_MAX_PAGES = 20;
+
+export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKey" | "apiFormat">): Promise<FetchedModel[]> {
     try {
         if (config.apiFormat === "gemini") {
-            const response = await axios.get<GeminiPayload>(geminiApiUrl({ ...defaultGeminiConfig, ...config }), { headers: geminiHeaders({ ...defaultGeminiConfig, ...config }) });
-            validateGeminiPayload(response.data);
-            return (response.data.models || [])
-                .map((model) => model.name?.replace(/^models\//, ""))
-                .filter((id): id is string => Boolean(id))
-                .sort((a, b) => a.localeCompare(b));
+            const merged = { ...defaultGeminiConfig, ...config };
+            const url = geminiApiUrl(merged);
+            const headers = geminiHeaders(merged);
+            const models = new Map<string, FetchedModel>();
+            let pageToken: string | undefined;
+            for (let page = 0; page < GEMINI_MODELS_MAX_PAGES; page++) {
+                const response = await axios.get<GeminiPayload>(url, {
+                    headers,
+                    params: { pageSize: GEMINI_MODELS_PAGE_SIZE, ...(pageToken ? { pageToken } : {}) },
+                });
+                validateGeminiPayload(response.data);
+                (response.data.models || []).forEach((model) => {
+                    const name = model.name?.replace(/^models\//, "");
+                    if (!name) return;
+                    // Real capability signal: which generation methods the model actually exposes,
+                    // rather than a guess from its name (see capabilityFromGeminiMethods).
+                    models.set(name, { name, capability: capabilityFromGeminiMethods(model.supportedGenerationMethods) });
+                });
+                pageToken = response.data.nextPageToken;
+                if (!pageToken) break;
+            }
+            return Array.from(models.values()).sort((a, b) => a.name.localeCompare(b.name));
         }
-        const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string } }>(buildApiUrl(config.baseUrl, "/models"), {
-            headers: {
-                Authorization: `Bearer ${config.apiKey}`,
-            },
-        });
+        const response = await axios.get<{ data?: Array<{ id?: string; architecture?: { output_modalities?: string[] } }>; error?: { message?: string } }>(
+            buildApiUrl(config.baseUrl, "/models"),
+            { headers: { Authorization: `Bearer ${config.apiKey}` } },
+        );
         return (response.data.data || [])
-            .map((model) => model.id)
-            .filter((id): id is string => Boolean(id))
-            .sort((a, b) => a.localeCompare(b));
+            .filter((model): model is { id: string; architecture?: { output_modalities?: string[] } } => Boolean(model.id))
+            // OpenRouter and similarly enriched OpenAI-compatible proxies attach an `architecture.output_modalities`
+            // field with real capability data; stock OpenAI's /v1/models has no such field, so this stays undefined
+            // there and the caller falls back to guessCapability.
+            .map((model) => ({ name: model.id, capability: capabilityFromOutputModalities(model.architecture?.output_modalities) }))
+            .sort((a, b) => a.name.localeCompare(b.name));
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("modelReadFailed")));
     }

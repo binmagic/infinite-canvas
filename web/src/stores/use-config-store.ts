@@ -15,6 +15,12 @@ export type ChannelModel = {
     script?: string;
 };
 
+/** A model name fetched from an upstream provider, plus capability inferred from real API metadata when available. */
+export type FetchedModel = {
+    name: string;
+    capability?: ModelCapability;
+};
+
 export type ModelChannel = {
     id: string;
     name: string;
@@ -147,6 +153,36 @@ export function guessCapability(name: string): ModelCapability {
     if (AUDIO_KEYWORDS.some((keyword) => value.includes(keyword))) return "audio";
     if (IMAGE_KEYWORDS.some((keyword) => value.includes(keyword))) return "image";
     return "text";
+}
+
+/**
+ * Infer a model's capability from Gemini's `supportedGenerationMethods` field, which reflects the
+ * model's real generation API rather than a guess from its name. `predict`/`predictLongRunning`
+ * back the Imagen/Veo image and video endpoints; `generateContent` backs chat/text (and Gemini's
+ * multimodal output still surfaces as text here since the API has no explicit output-modality field).
+ * Returns undefined when the methods don't map to a known capability (e.g. embedding-only models).
+ */
+export function capabilityFromGeminiMethods(methods: string[] | undefined): ModelCapability | undefined {
+    if (!methods?.length) return undefined;
+    if (methods.includes("predictLongRunning")) return "video";
+    if (methods.includes("predict")) return "image";
+    if (methods.includes("generateContent") || methods.includes("streamGenerateContent")) return "text";
+    return undefined;
+}
+
+/**
+ * Infer a model's capability from an OpenRouter-style `architecture.output_modalities` array, an
+ * explicit field some OpenAI-compatible aggregators add to their /models response. Real metadata,
+ * not a name guess. Priority mirrors guessCapability (video > audio > image > text) since a model
+ * can list multiple output modalities.
+ */
+export function capabilityFromOutputModalities(modalities: string[] | undefined): ModelCapability | undefined {
+    if (!modalities?.length) return undefined;
+    if (modalities.includes("video")) return "video";
+    if (modalities.includes("audio")) return "audio";
+    if (modalities.includes("image")) return "image";
+    if (modalities.includes("text")) return "text";
+    return undefined;
 }
 
 function findChannelModel(config: AiConfig, value: string): { channel: ModelChannel; model: ChannelModel } | null {
