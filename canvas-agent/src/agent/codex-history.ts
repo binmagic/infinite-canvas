@@ -557,7 +557,7 @@ function canvasContentSummary(nodes: unknown[], connections: number) {
         result[type] = (result[type] || 0) + 1;
         return result;
     }, {});
-    const known = new Set(["text", "image", "config", "video", "audio", "group"]);
+    const known = new Set(["text", "image", "config", "video", "audio", "group", "director"]);
     const other = Object.entries(counts).reduce((total, [type, count]) => total + (known.has(type) ? 0 : count), 0);
     const parts = [
         counts.text ? `${counts.text} 个文本` : "",

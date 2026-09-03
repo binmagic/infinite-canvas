@@ -1,4 +1,4 @@
-import { FileText, Group, Image as ImageIcon, Music2, Settings2, Video } from "lucide-react";
+import { Clapperboard, FileText, Group, Image as ImageIcon, Music2, Settings2, Video } from "lucide-react";
 
 import i18n from "@/i18n";
 
@@ -6,6 +6,7 @@ import { NODE_SPECS } from "@/constant/canvas";
 import { registerNodeDefinitions } from "@/lib/canvas/node-registry";
 import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
 import type { CanvasNodeDefinition, CanvasNodeResource } from "@/types/canvas-plugin";
+import { DirectorNodeContent, DirectorPanel } from "@/components/canvas/nodes/director-node";
 
 // Extensible metadata for built-in nodes, reusing NODE_SPECS for size and initial metadata.
 // Rendering remains in canvas-node's internal renderer, so no Content component is provided.
@@ -31,9 +32,26 @@ const BUILTIN_DEFINITIONS: CanvasNodeDefinition[] = [
     return { ...def, title: spec.title, defaultSize: { width: spec.width, height: spec.height }, defaultMetadata: spec.metadata };
 });
 
+// Director is not part of the built-in CanvasNodeType enum; it is registered as a self-contained
+// plugin-shaped definition (Content + Panel) instead of going through NODE_SPECS.
+const DIRECTOR_DEFINITION: CanvasNodeDefinition = {
+    type: "director",
+    get title() {
+        return i18n.t("canvas.nodeTypes.director");
+    },
+    icon: <Clapperboard className={iconClass} />,
+    defaultSize: { width: 340, height: 240 },
+    defaultMetadata: { status: "idle" },
+    minimapColor: "#14b8a6",
+    hasSourceHandle: false,
+    autoOpenPanel: true,
+    Content: DirectorNodeContent,
+    Panel: DirectorPanel,
+};
+
 let registered = false;
 export function registerBuiltinNodes() {
     if (registered) return;
     registered = true;
-    registerNodeDefinitions(BUILTIN_DEFINITIONS, "builtin");
+    registerNodeDefinitions([...BUILTIN_DEFINITIONS, DIRECTOR_DEFINITION], "builtin");
 }

@@ -239,10 +239,14 @@ export default {
         agentDisconnected: "Codex 未连接",
         connecting: "连接中",
         openAgent: "打开本地 Codex 面板",
-        nodeTypes: { image: "图片", text: "文本", config: "生成配置", video: "视频", audio: "音频", group: "组" },
+        nodeTypes: { image: "图片", text: "文本", config: "生成配置", video: "视频", audio: "音频", group: "组", director: "导演台" },
         toolbar: {
-            select: "选择", pan: "移动", text: "文本", image: "图片", video: "视频", audio: "音频", config: "生成配置", group: "组", extensions: "扩展节点", upload: "上传资产", appearance: "画布外观", clear: "清空画布",
+            select: "选择", pan: "移动", text: "文本", image: "图片", video: "视频", audio: "音频", config: "生成配置", group: "组", director: "导演台", extensions: "扩展节点", upload: "上传资产", appearance: "画布外观", clear: "清空画布",
             themeMode: "主题模式", light: "浅色", dark: "深色", gridStyle: "网格样式", dots: "点", lines: "线", blank: "空白", imageInfo: "图片信息",
+        },
+        director: {
+            title: "导演台",
+            openHint: "点击打开导演台，搭建白模分镜并导出图片/视频到画布",
         },
         project: {
             untitled: "未命名画布", imported: "导入画布",
@@ -311,6 +315,7 @@ export default {
     },
     navigation: {
         canvas: "我的画布",
+        director: "导演台",
         image: "生图工作台",
         video: "视频创作台",
         prompts: "提示词库",

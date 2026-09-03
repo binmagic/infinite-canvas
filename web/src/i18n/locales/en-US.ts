@@ -239,10 +239,14 @@ export default {
         agentDisconnected: "Codex disconnected",
         connecting: "Connecting",
         openAgent: "Open local Codex panel",
-        nodeTypes: { image: "Image", text: "Text", config: "Generation config", video: "Video", audio: "Audio", group: "Group" },
+        nodeTypes: { image: "Image", text: "Text", config: "Generation config", video: "Video", audio: "Audio", group: "Group", director: "Director" },
         toolbar: {
-            select: "Select", pan: "Move", text: "Text", image: "Image", video: "Video", audio: "Audio", config: "Generation config", group: "Group", extensions: "Extension nodes", upload: "Upload assets", appearance: "Canvas appearance", clear: "Clear canvas",
+            select: "Select", pan: "Move", text: "Text", image: "Image", video: "Video", audio: "Audio", config: "Generation config", group: "Group", director: "Director", extensions: "Extension nodes", upload: "Upload assets", appearance: "Canvas appearance", clear: "Clear canvas",
             themeMode: "Theme", light: "Light", dark: "Dark", gridStyle: "Grid style", dots: "Dots", lines: "Lines", blank: "Blank", imageInfo: "Image info",
+        },
+        director: {
+            title: "Director",
+            openHint: "Open the director studio to build white-model shots and export images/videos to the canvas",
         },
         project: {
             untitled: "Untitled canvas", imported: "Imported canvas",
@@ -311,6 +315,7 @@ export default {
     },
     navigation: {
         canvas: "My Canvases",
+        director: "Director",
         image: "Image Studio",
         video: "Video Studio",
         prompts: "Prompt Library",
