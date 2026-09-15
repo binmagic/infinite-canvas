@@ -28,7 +28,7 @@ import { CanvasNodeContextMenu } from "@/components/canvas/canvas-context-menu";
 import { CanvasNodeAngleDialog, type CanvasImageAngleParams } from "@/components/canvas/canvas-node-angle-dialog";
 import { CanvasNodeCropDialog, type CanvasImageCropRect } from "@/components/canvas/canvas-node-crop-dialog";
 import { CanvasNodeMaskEditDialog, type CanvasImageMaskEditPayload } from "@/components/canvas/canvas-node-mask-edit-dialog";
-import { CanvasNodeAnnotationEditDialog, type CanvasImageAnnotationEditPayload } from "@/components/canvas/canvas-node-annotation-edit-dialog";
+import { CanvasNodeAnnotationEditDialog, clearAnnotationDraft, type CanvasImageAnnotationEditPayload } from "@/components/canvas/canvas-node-annotation-edit-dialog";
 import { CanvasNodeSplitDialog, type CanvasImageSplitParams } from "@/components/canvas/canvas-node-split-dialog";
 import { CanvasNodeUpscaleDialog, type CanvasImageUpscaleParams } from "@/components/canvas/canvas-node-upscale-dialog";
 import { buildNodeGenerationContext, buildNodeGenerationInputs, buildNodeResponseMessages, hydrateNodeGenerationContext, type NodeGenerationInput } from "@/components/canvas/canvas-node-generation";
@@ -748,6 +748,8 @@ function InfiniteCanvasPage() {
             setInfoNodeId((current) => (current && allIds.has(current) ? null : current));
             setCropNodeId((current) => (current && allIds.has(current) ? null : current));
             setMaskEditNodeId((current) => (current && allIds.has(current) ? null : current));
+            setAnnotateEditNodeId((current) => (current && allIds.has(current) ? null : current));
+            allIds.forEach((id) => clearAnnotationDraft(id));
             setAngleNodeId((current) => (current && allIds.has(current) ? null : current));
             setPreviewNodeId((current) => (current && allIds.has(current) ? null : current));
             setRunningNodeId((current) => (current && allIds.has(current) ? null : current));
@@ -3209,7 +3211,13 @@ function InfiniteCanvasPage() {
                 ) : null}
 
                 {annotateEditNode?.metadata?.content ? (
-                    <CanvasNodeAnnotationEditDialog dataUrl={annotateEditNode.metadata.content} open={Boolean(annotateEditNode)} onClose={() => setAnnotateEditNodeId(null)} onConfirm={(payload) => void annotateEditImageNode(annotateEditNode!, payload)} />
+                    <CanvasNodeAnnotationEditDialog
+                        nodeId={annotateEditNode.id}
+                        dataUrl={annotateEditNode.metadata.content}
+                        open={Boolean(annotateEditNode)}
+                        onClose={() => setAnnotateEditNodeId(null)}
+                        onConfirm={(payload) => void annotateEditImageNode(annotateEditNode!, payload)}
+                    />
                 ) : null}
 
                 {splitNode?.metadata?.content ? <CanvasNodeSplitDialog dataUrl={splitNode.metadata.content} open={Boolean(splitNode)} onClose={() => setSplitNodeId(null)} onConfirm={(params) => void splitImageNode(splitNode!, params)} /> : null}
