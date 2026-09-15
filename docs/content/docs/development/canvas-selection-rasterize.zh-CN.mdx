@@ -1,0 +1,315 @@
+---
+title: 画布选区栅格化方案
+description: 用现有 React state 技术实现 tldraw toImageDataUrl 等价能力，把多选节点合成一张参考图喂给 AI
+---
+
+# 画布选区栅格化方案（路线 A）
+
+本文是一份**待实施的设计方案**，不是已完成功能的说明文档。目的是在不引入 tldraw 的前提下，用本项目现有的 React state + Canvas 2D 技术栈，实现 Cowart 中 `editor.toImageDataUrl()` 的等价能力：**把画布上多选的节点合成一张 PNG 参考图，作为视觉输入喂给图像模型**。
+
+## 背景与动机
+
+参考项目 Cowart（`F:\canvas\Cowart`，基于 tldraw）的 AI 图像编辑流程是这样一条 agent 工具链：
+
+```
+get_selection → export_selection_reference → generate_image → insert_image
+```
+
+其中 `export_selection_reference` 调用 tldraw 原生 API `editor.toImageDataUrl(ids)`，把选中的**所有形状**（图片、箭头、文字标签）栅格化进同一张 PNG，然后作为 `referenceDataUrl` 传给图像模型。Cowart 的关键设计是：**标注不做结构化语义解析**，而是靠"视觉栅格化 + 提示词引导"让模型自己看懂标注意图。
+
+对比本项目现状，Cowart 流程里 tldraw 实际承担的能力只有三项，其中两项本项目已有等价实现：
+
+| tldraw 提供的能力 | 本项目现状 |
+| --- | --- |
+| `editor.store`（shape/asset 数据模型） | 已有等价物：React state + `CanvasNodeData` 节点模型 |
+| store 快照持久化 | 已有等价物：`localForage` 持久化 + `exportCanvasProjects` / `exportCanvasNodes` |
+| **`editor.toImageDataUrl(ids)`** 选区栅格化 | **缺通用能力**——标注场景已手写（`buildAnnotatedImage`），但没有"任选多个节点 → 合成一张参考图" |
+
+所以"用 React state 实现 tldraw"这件事，收敛成一个具体任务：**实现通用的选区栅格化**。不需要引入 tldraw，也不需要改动画布架构。
+
+### 与现有标注编辑功能的关系
+
+`canvas-node-annotation-edit-dialog.tsx` 里的 `buildAnnotatedImage()` 已经验证过"离屏 canvas 合成 → `toDataURL`"这条路可行，但它是**单图片 + 箭头标注**的专用实现：
+
+```ts
+// web/src/components/canvas/canvas-node-annotation-edit-dialog.tsx
+async function buildAnnotatedImage(dataUrl: string, annotationCanvas: HTMLCanvasElement, geometry: CanvasGeometry) {
+    const source = await loadImageElement(dataUrl);
+    const canvas = document.createElement("canvas");
+    canvas.width = geometry.canvasWidth;
+    canvas.height = geometry.canvasHeight;
+    const context = canvas.getContext("2d");
+    if (!context) return dataUrl;
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(source, geometry.imageOffsetX, geometry.imageOffsetY, geometry.imageWidth, geometry.imageHeight);
+    context.drawImage(annotationCanvas, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/png");
+}
+```
+
+本方案要做的是把这套思路泛化成**多节点、跨类型、含连线**的通用版本，供标注编辑之外的场景复用。两者不冲突：标注编辑可以继续用自己的专用实现，也可以在后续重构中改为调用通用函数（见"后续可选项"）。
+
+## 方案选型：为什么选路线 A
+
+有两条技术路线可以实现选区栅格化。
+
+### 路线 A：Canvas 2D 手工合成（本方案采用）
+
+延续 `buildAnnotatedImage` 已验证的模式，用 Canvas 2D API 按节点数据手工绘制。
+
+- 优点：零新依赖、纯函数、确定性强、可单测、与现有 `canvas-image-data.ts` 风格一致
+- 局限：只能画"明确教它画的东西"（图片、线条、文字），自定义插件节点的复杂 DOM/CSS 样式渲染不出来
+
+### 路线 B：DOM 转图（`html-to-image` 之类）
+
+直接对画布真实渲染的 DOM 子树截图。
+
+- 优点：视觉保真度接近所见即所得，插件节点、CSS 样式全部能捕获
+- 局限：新增依赖、性能较差、跨域图片和字体加载有坑、暗色主题/滤镜等 CSS 边界情况容易出问题
+
+### 选型结论
+
+**选路线 A。** 本项目画布上承载 AI 生成语义的节点绝大多数是图片节点，路线 A 足够覆盖主要场景；真需要高保真时再把路线 B 作为可选降级方案补上（见"后续可选项"）。这样既拿到了"多选内容 → 一张参考图 → 喂给模型"的能力，又不动画布架构、不丢节点连线推演这个核心特色。
+
+## 现有数据结构（实现依据）
+
+方案完全基于现有类型，不需要改动数据模型。
+
+```ts
+// web/src/types/canvas.ts
+export type CanvasNodeData = {
+    id: string;
+    type: CanvasNodeTypeId;       // image / text / config / video / audio / group / "<pluginId>:<name>"
+    title: string;
+    position: Position;           // 画布坐标
+    width: number;
+    height: number;
+    metadata?: CanvasNodeMetadata;
+};
+
+export type CanvasConnection = {
+    id: string;
+    fromNodeId: string;
+    toNodeId: string;
+};
+```
+
+栅格化会用到的 `CanvasNodeMetadata` 字段：
+
+| 字段 | 用途 |
+| --- | --- |
+| `content` | 图片节点的展示 URL / dataUrl；文本节点的正文 |
+| `storageKey` | 图片 Blob 在 `localForage` 里的键，需经 `resolveImageUrl()` 换成可加载 URL |
+| `fontSize` | 文本节点字号 |
+| `naturalWidth` / `naturalHeight` | 图片原始尺寸，用于计算清晰度倍率 |
+| `status` | 节点状态；`loading` / `error` 的节点应跳过或画占位 |
+
+可复用的现有工具：
+
+- `resolveImageUrl(storageKey, fallback)` —— `web/src/services/image-storage.ts`，把 `storageKey` 解析成可加载 URL
+- `uploadImage(input, options)` —— 同上，把生成结果写回存储
+- `web/src/lib/canvas/canvas-image-data.ts` —— 已有 `cropDataUrl` / `splitDataUrl` / `transformAngleDataUrl` / `upscaleDataUrl` 等 Canvas 2D 处理函数，本方案的新函数应放在同类位置并保持相同风格
+
+## 实现设计
+
+### 新增文件
+
+`web/src/lib/canvas/canvas-selection-rasterize.ts`
+
+选择独立文件而非塞进 `canvas-image-data.ts` 的理由：后者处理的是"单张图片的像素变换"（裁剪、切分、旋转、放大），本方案处理的是"多节点场景合成"，职责不同。
+
+### 核心 API
+
+```ts
+export type RasterizeSelectionOptions = {
+    /** 选区外扩留白，单位为画布像素，默认 24 */
+    padding?: number;
+    /** 输出清晰度倍率，默认 2（对齐 Cowart 的 pixelRatio: 2） */
+    pixelRatio?: number;
+    /** 背景色，默认 "#ffffff"；传 null 输出透明背景 */
+    background?: string | null;
+    /** 是否绘制节点间连线，默认 true */
+    drawConnections?: boolean;
+    /** 是否绘制节点标题，默认 false */
+    drawTitles?: boolean;
+};
+
+export type RasterizedSelection = {
+    dataUrl: string;
+    width: number;
+    height: number;
+    /** 实际参与合成的节点 id，便于调用方核对与日志 */
+    nodeIds: string[];
+    /** 选区在画布坐标系里的包围盒，供后续定位/插入新节点复用 */
+    bounds: { x: number; y: number; width: number; height: number };
+};
+
+export async function rasterizeCanvasSelection(
+    nodes: CanvasNodeData[],
+    connections: CanvasConnection[],
+    selectedNodeIds: Set<string> | string[],
+    options?: RasterizeSelectionOptions,
+): Promise<RasterizedSelection | null>;
+```
+
+返回 `null` 而不是抛错的情况：选区为空、或选区内没有任何可渲染节点。调用方据此决定是否提示用户。
+
+### 执行步骤
+
+```
+选中节点 id 集合
+  ↓
+1. 过滤 + 收集：挑出选中且可渲染的节点
+  ↓
+2. 计算包围盒：min/max 遍历 position + width/height，外扩 padding
+  ↓
+3. 建离屏 canvas：尺寸 = 包围盒 × pixelRatio，填背景色
+  ↓
+4. 画连线：遍历 connections，两端都在选区内的才画
+  ↓
+5. 画节点：按 type 分派绘制策略，坐标 = 节点画布坐标 - 包围盒原点
+  ↓
+6. toDataURL("image/png") → 返回 dataUrl + 尺寸 + 包围盒
+```
+
+**步骤 1 — 过滤与收集**
+
+```ts
+const idSet = selectedNodeIds instanceof Set ? selectedNodeIds : new Set(selectedNodeIds);
+const selected = nodes.filter((node) => idSet.has(node.id));
+if (!selected.length) return null;
+```
+
+`group` 类型节点的处理：group 只是逻辑分组容器，本身无视觉内容。若选区包含 group，应展开成其成员节点（通过 `metadata.groupId` 反查），避免画出空白框。
+
+**步骤 2 — 包围盒**
+
+```ts
+const minX = Math.min(...selected.map((n) => n.position.x));
+const minY = Math.min(...selected.map((n) => n.position.y));
+const maxX = Math.max(...selected.map((n) => n.position.x + n.width));
+const maxY = Math.max(...selected.map((n) => n.position.y + n.height));
+const bounds = {
+    x: minX - padding,
+    y: minY - padding,
+    width: maxX - minX + padding * 2,
+    height: maxY - minY + padding * 2,
+};
+```
+
+**步骤 3 — 离屏 canvas**
+
+```ts
+const canvas = document.createElement("canvas");
+canvas.width = Math.max(1, Math.round(bounds.width * pixelRatio));
+canvas.height = Math.max(1, Math.round(bounds.height * pixelRatio));
+const context = canvas.getContext("2d");
+if (!context) return null;
+context.scale(pixelRatio, pixelRatio);   // 之后所有绘制都用画布坐标，不用手动乘倍率
+if (background) {
+    context.fillStyle = background;
+    context.fillRect(0, 0, bounds.width, bounds.height);
+}
+```
+
+用 `context.scale()` 而不是在每次 `drawImage` 时乘倍率，可以让后续绘制逻辑全部使用画布坐标系，减少出错。
+
+**步骤 4 — 连线**
+
+```ts
+if (drawConnections) {
+    for (const connection of connections) {
+        if (!idSet.has(connection.fromNodeId) || !idSet.has(connection.toNodeId)) continue;
+        const from = nodeById.get(connection.fromNodeId);
+        const to = nodeById.get(connection.toNodeId);
+        if (!from || !to) continue;
+        // 从 from 节点右边缘中点画到 to 节点左边缘中点（与画布上的视觉一致）
+        // 坐标需减去 bounds.x / bounds.y
+    }
+}
+```
+
+连线样式应尽量贴合画布上的实际观感（颜色、粗细、是否带箭头）。**这一项需要在实施前核对 `canvas-connection` 相关组件的真实渲染参数**，本方案不预设具体数值。
+
+**步骤 5 — 节点绘制分派**
+
+按 `node.type` 分派，各类型的绘制策略：
+
+| 节点类型 | 绘制策略 |
+| --- | --- |
+| `image` | 主路径。`metadata.content` 或经 `resolveImageUrl(metadata.storageKey)` 拿到 URL，`loadImageElement` 后 `drawImage` 到节点矩形 |
+| `text` | 用 `metadata.content` + `metadata.fontSize` 画文字，需自行处理换行与溢出裁剪 |
+| `video` / `audio` | 无法直接画媒体帧。方案：画一个带类型标识的占位矩形（或后续扩展为抽取视频首帧） |
+| `config` | 生成配置节点，无视觉语义。默认**跳过**（不画） |
+| `group` | 展开为成员节点，自身不画 |
+| 插件节点 | 路线 A 无法渲染其自定义 DOM。默认跳过，并在返回值中记录被跳过的 id |
+
+图片加载失败、`status === "error"`、`status === "loading"` 的节点：跳过而不是让整个栅格化失败。
+
+**步骤 6 — 输出**
+
+```ts
+return {
+    dataUrl: canvas.toDataURL("image/png"),
+    width: canvas.width,
+    height: canvas.height,
+    nodeIds: renderedIds,
+    bounds,
+};
+```
+
+## 调用方接入点
+
+### 主要场景：多选节点 → AI 编辑
+
+在 `web/src/pages/canvas/project.tsx` 里，现有 `annotateEditImageNode` 已经演示了完整的"参考图 → `requestEdit` → 新建子节点"链路：
+
+```ts
+// 现有实现（标注编辑），可作为新场景的模板
+const annotatedReference = { id: `${node.id}-annotated`, name: "annotated.png", type: "image/png", dataUrl: payload.annotatedDataUrl };
+const image = await requestEdit(generationConfig, prompt, [annotatedReference], undefined, { signal: controller.signal }).then((items) => items[0]);
+```
+
+新场景只需把 `payload.annotatedDataUrl` 换成 `rasterizeCanvasSelection()` 的输出，其余流程（模型解析、子节点创建、连线、错误处理）完全复用现有代码。
+
+`bounds` 字段的用途：新生成的节点可以放在选区右侧（`bounds.x + bounds.width + 间距`），与现有 `annotateEditImageNode` 里 `node.position.x + node.width + 96` 的定位逻辑保持一致的观感。
+
+### 提示词配合
+
+Cowart 的核心经验是**栅格化必须配合提示词引导**才能生效。本项目已有对应的 i18n 模板可参照：
+
+```ts
+// web/src/i18n/locales/zh-CN.ts
+annotatePrompt: "请按标注箭头修改图片。输出图像中不要保留任何标注痕迹：彩色箭头线条与箭头头、箭头末端的编号或文字标签、蓝色虚线选中圈。其余部分保持原图不变。{{prompt}}"
+```
+
+多节点选区栅格化场景需要新增一个类似的模板 key，明确告诉模型：参考图里有多个画面元素和连线，应该如何理解它们的关系、输出时要不要保留连线痕迹。**具体措辞待实施时确定**，原则是像 `annotatePrompt` 一样明确列出要去除的视觉元素。
+
+## 待确认事项
+
+实施前需要逐项核实或决策，本方案不做预设：
+
+1. **连线渲染参数** —— 需核对画布上连线组件的真实颜色、粗细、端点位置、是否带箭头，让栅格化结果与画布观感一致。
+2. **文本节点绘制精度** —— 画布上文本节点用 DOM 渲染（含字体、行高、自动换行）。Canvas 2D 手工画文字很难 1:1 对齐，需决定接受多大程度的差异，或对文本节点也走跳过策略。
+3. **video / audio 节点** —— 是画占位矩形，还是抽取视频首帧（需额外实现），还是直接跳过。
+4. **插件节点** —— 确认跳过是否可接受；若不可接受，可能需要为 `CanvasNodeDefinition` 增加可选的"栅格化钩子"，让插件自己提供一张缩略图。
+5. **是否重构标注编辑复用本函数** —— 见下节。
+6. **多选场景的入口 UI** —— 从哪里触发（右键菜单 / 工具栏按钮 / agent 工具），本方案只提供底层能力，不含 UI 设计。
+
+## 后续可选项
+
+- **标注编辑改为复用通用函数** —— `buildAnnotatedImage` 与本方案有重叠（都是离屏合成）。可在通用函数稳定后，把标注编辑重构为"`rasterizeCanvasSelection` 输出底图 + 叠加标注画布"，减少重复代码。但标注编辑有留白区域（`PADDING_RATIO = 0.4`）等专属逻辑，重构需谨慎，**不建议与本方案同批进行**。
+- **路线 B 作为高保真降级方案** —— 若实际使用中发现插件节点/文本节点的渲染差异不可接受，再引入 `html-to-image` 作为可选路径，让调用方按需选择"快速确定性合成"或"高保真截图"。
+- **agent 工具接入** —— Cowart 的 `export_selection_reference` 是一个 agent tool。本项目已有 `web/src/lib/agent/agent-site-tools.ts`，理论上可以把本函数包装成工具暴露给 agent 面板。但这是**独立的架构决策**（要不要让 agent 驱动图像生成），与栅格化能力本身无关，需单独评估。
+
+## 验证方式
+
+实施后应覆盖：
+
+1. `npm run typecheck` + `npm run build` 无错误。
+2. 单节点选区：输出图与该节点原图一致（含 padding 和背景）。
+3. 多节点选区：各节点相对位置与画布上一致，连线正确绘制。
+4. 混合类型选区：图片正常绘制，config 节点被跳过，跳过的 id 出现在返回值里。
+5. 边界情况：空选区返回 `null`；图片加载失败的节点被跳过而不导致整体失败；`pixelRatio` 生效（输出像素尺寸 = 包围盒 × 倍率）。
+6. 接入 AI 编辑后：检查发给模型的参考图内容正确（可在网络请求里核对 FormData 里的 image 字段）。

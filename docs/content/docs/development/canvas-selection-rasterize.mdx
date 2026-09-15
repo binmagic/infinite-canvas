@@ -1,0 +1,315 @@
+---
+title: Canvas Selection Rasterization
+description: Implement the equivalent of tldraw's toImageDataUrl with the existing React state stack, compositing multi-selected nodes into one reference image for AI
+---
+
+# Canvas Selection Rasterization (Route A)
+
+This is a **design proposal pending implementation**, not documentation of a shipped feature. The goal is to implement the equivalent of Cowart's `editor.toImageDataUrl()` without adopting tldraw, using this project's existing React state + Canvas 2D stack: **composite the multi-selected canvas nodes into a single PNG reference image to feed an image model as visual input**.
+
+## Background and motivation
+
+The reference project Cowart (`F:\canvas\Cowart`, built on tldraw) drives AI image editing through an agent tool chain:
+
+```
+get_selection → export_selection_reference → generate_image → insert_image
+```
+
+`export_selection_reference` calls tldraw's native `editor.toImageDataUrl(ids)`, rasterizing **every selected shape** (images, arrows, text labels) into one PNG, which is then passed to the image model as `referenceDataUrl`. Cowart's key design decision: **annotations are not parsed structurally**; they work through "visual rasterization + prompt guidance", letting the model interpret the annotation intent itself.
+
+Comparing against this project, tldraw only provides three capabilities in that flow, and two already have equivalents here:
+
+| Capability tldraw provides | Current state in this project |
+| --- | --- |
+| `editor.store` (shape/asset data model) | Equivalent exists: React state + the `CanvasNodeData` node model |
+| Store snapshot persistence | Equivalent exists: `localForage` persistence + `exportCanvasProjects` / `exportCanvasNodes` |
+| **`editor.toImageDataUrl(ids)`** selection rasterization | **Missing as a general capability** — hand-written for the annotation case (`buildAnnotatedImage`), but there is no "select arbitrary nodes → composite one reference image" |
+
+So "implementing tldraw with React state" reduces to one concrete task: **build general-purpose selection rasterization**. No tldraw dependency, no canvas architecture changes.
+
+### Relationship to the existing annotation editor
+
+`buildAnnotatedImage()` in `canvas-node-annotation-edit-dialog.tsx` already proves the "offscreen canvas composite → `toDataURL`" approach works, but it is a **single-image + arrow-annotation** special case:
+
+```ts
+// web/src/components/canvas/canvas-node-annotation-edit-dialog.tsx
+async function buildAnnotatedImage(dataUrl: string, annotationCanvas: HTMLCanvasElement, geometry: CanvasGeometry) {
+    const source = await loadImageElement(dataUrl);
+    const canvas = document.createElement("canvas");
+    canvas.width = geometry.canvasWidth;
+    canvas.height = geometry.canvasHeight;
+    const context = canvas.getContext("2d");
+    if (!context) return dataUrl;
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(source, geometry.imageOffsetX, geometry.imageOffsetY, geometry.imageWidth, geometry.imageHeight);
+    context.drawImage(annotationCanvas, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/png");
+}
+```
+
+This proposal generalizes that approach into a **multi-node, cross-type, connection-aware** version reusable beyond annotation editing. The two do not conflict: annotation editing can keep its dedicated implementation, or switch to the general function in a later refactor (see "Optional follow-ups").
+
+## Route selection: why Route A
+
+Two technical routes can deliver selection rasterization.
+
+### Route A: manual Canvas 2D compositing (chosen)
+
+Extend the pattern already proven by `buildAnnotatedImage`, drawing from node data via the Canvas 2D API.
+
+- Pros: zero new dependencies, pure function, deterministic, unit-testable, consistent with the existing `canvas-image-data.ts` style
+- Limits: can only draw what it is explicitly taught to draw (images, lines, text); custom plugin nodes' complex DOM/CSS cannot be rendered
+
+### Route B: DOM-to-image (something like `html-to-image`)
+
+Screenshot the actually-rendered canvas DOM subtree.
+
+- Pros: near-WYSIWYG fidelity; plugin nodes and CSS styling are all captured
+- Limits: new dependency, slower, pitfalls with cross-origin images and font loading, and edge cases around dark theme / CSS filters
+
+### Conclusion
+
+**Route A.** The nodes carrying AI-generation semantics on this canvas are overwhelmingly image nodes, so Route A covers the primary scenarios; Route B can be added later as an optional high-fidelity fallback (see "Optional follow-ups"). This gains the "multi-select content → one reference image → feed the model" capability without touching canvas architecture or compromising the node-graph/connection workflow that distinguishes this project.
+
+## Existing data structures (implementation basis)
+
+The proposal builds entirely on current types; no data model changes required.
+
+```ts
+// web/src/types/canvas.ts
+export type CanvasNodeData = {
+    id: string;
+    type: CanvasNodeTypeId;       // image / text / config / video / audio / group / "<pluginId>:<name>"
+    title: string;
+    position: Position;           // canvas coordinates
+    width: number;
+    height: number;
+    metadata?: CanvasNodeMetadata;
+};
+
+export type CanvasConnection = {
+    id: string;
+    fromNodeId: string;
+    toNodeId: string;
+};
+```
+
+`CanvasNodeMetadata` fields used during rasterization:
+
+| Field | Purpose |
+| --- | --- |
+| `content` | Image node's display URL / dataUrl; text node's body text |
+| `storageKey` | Key for the image Blob in `localForage`; must go through `resolveImageUrl()` to become a loadable URL |
+| `fontSize` | Text node font size |
+| `naturalWidth` / `naturalHeight` | Original image dimensions, used for sharpness ratio calculations |
+| `status` | Node status; `loading` / `error` nodes should be skipped or drawn as placeholders |
+
+Reusable existing utilities:
+
+- `resolveImageUrl(storageKey, fallback)` — `web/src/services/image-storage.ts`, resolves a `storageKey` into a loadable URL
+- `uploadImage(input, options)` — same file, writes generated results back to storage
+- `web/src/lib/canvas/canvas-image-data.ts` — already contains Canvas 2D helpers such as `cropDataUrl` / `splitDataUrl` / `transformAngleDataUrl` / `upscaleDataUrl`; the new function should live alongside these and follow the same style
+
+## Implementation design
+
+### New file
+
+`web/src/lib/canvas/canvas-selection-rasterize.ts`
+
+Rationale for a separate file rather than extending `canvas-image-data.ts`: the latter handles "pixel transforms on a single image" (crop, split, rotate, upscale), whereas this handles "multi-node scene compositing" — a different responsibility.
+
+### Core API
+
+```ts
+export type RasterizeSelectionOptions = {
+    /** Padding around the selection, in canvas pixels; default 24 */
+    padding?: number;
+    /** Output sharpness multiplier; default 2 (matching Cowart's pixelRatio: 2) */
+    pixelRatio?: number;
+    /** Background color; default "#ffffff"; pass null for a transparent background */
+    background?: string | null;
+    /** Whether to draw connections between nodes; default true */
+    drawConnections?: boolean;
+    /** Whether to draw node titles; default false */
+    drawTitles?: boolean;
+};
+
+export type RasterizedSelection = {
+    dataUrl: string;
+    width: number;
+    height: number;
+    /** IDs of nodes actually composited, for caller verification and logging */
+    nodeIds: string[];
+    /** Selection bounding box in canvas coordinates, reusable for placing/inserting new nodes */
+    bounds: { x: number; y: number; width: number; height: number };
+};
+
+export async function rasterizeCanvasSelection(
+    nodes: CanvasNodeData[],
+    connections: CanvasConnection[],
+    selectedNodeIds: Set<string> | string[],
+    options?: RasterizeSelectionOptions,
+): Promise<RasterizedSelection | null>;
+```
+
+Returns `null` rather than throwing when: the selection is empty, or the selection contains no renderable nodes. Callers decide whether to surface a message.
+
+### Execution steps
+
+```
+selected node ID set
+  ↓
+1. Filter + collect: pick selected, renderable nodes
+  ↓
+2. Compute bounds: min/max over position + width/height, expanded by padding
+  ↓
+3. Create offscreen canvas: size = bounds × pixelRatio, fill background
+  ↓
+4. Draw connections: iterate connections, only those with both ends in the selection
+  ↓
+5. Draw nodes: dispatch by type; coordinates = node canvas coords − bounds origin
+  ↓
+6. toDataURL("image/png") → return dataUrl + dimensions + bounds
+```
+
+**Step 1 — filter and collect**
+
+```ts
+const idSet = selectedNodeIds instanceof Set ? selectedNodeIds : new Set(selectedNodeIds);
+const selected = nodes.filter((node) => idSet.has(node.id));
+if (!selected.length) return null;
+```
+
+Handling `group` nodes: a group is only a logical container with no visual content of its own. If the selection contains a group, expand it into its member nodes (looked up via `metadata.groupId`) to avoid drawing an empty frame.
+
+**Step 2 — bounding box**
+
+```ts
+const minX = Math.min(...selected.map((n) => n.position.x));
+const minY = Math.min(...selected.map((n) => n.position.y));
+const maxX = Math.max(...selected.map((n) => n.position.x + n.width));
+const maxY = Math.max(...selected.map((n) => n.position.y + n.height));
+const bounds = {
+    x: minX - padding,
+    y: minY - padding,
+    width: maxX - minX + padding * 2,
+    height: maxY - minY + padding * 2,
+};
+```
+
+**Step 3 — offscreen canvas**
+
+```ts
+const canvas = document.createElement("canvas");
+canvas.width = Math.max(1, Math.round(bounds.width * pixelRatio));
+canvas.height = Math.max(1, Math.round(bounds.height * pixelRatio));
+const context = canvas.getContext("2d");
+if (!context) return null;
+context.scale(pixelRatio, pixelRatio);   // all later drawing uses canvas coordinates, no manual scaling
+if (background) {
+    context.fillStyle = background;
+    context.fillRect(0, 0, bounds.width, bounds.height);
+}
+```
+
+Using `context.scale()` instead of multiplying by the ratio at each `drawImage` lets all subsequent drawing work in canvas coordinates, reducing mistakes.
+
+**Step 4 — connections**
+
+```ts
+if (drawConnections) {
+    for (const connection of connections) {
+        if (!idSet.has(connection.fromNodeId) || !idSet.has(connection.toNodeId)) continue;
+        const from = nodeById.get(connection.fromNodeId);
+        const to = nodeById.get(connection.toNodeId);
+        if (!from || !to) continue;
+        // draw from the from-node's right edge midpoint to the to-node's left edge midpoint
+        // (matching how it looks on the canvas); subtract bounds.x / bounds.y from coordinates
+    }
+}
+```
+
+Connection styling should match the on-canvas appearance (color, thickness, arrowhead or not). **This must be verified against the actual rendering parameters of the connection components before implementation**; this proposal deliberately does not assume specific values.
+
+**Step 5 — node drawing dispatch**
+
+Dispatch on `node.type`:
+
+| Node type | Drawing strategy |
+| --- | --- |
+| `image` | Primary path. Get the URL from `metadata.content` or via `resolveImageUrl(metadata.storageKey)`, then `loadImageElement` and `drawImage` into the node rect |
+| `text` | Draw text using `metadata.content` + `metadata.fontSize`; wrapping and overflow clipping must be handled manually |
+| `video` / `audio` | Media frames cannot be drawn directly. Approach: draw a placeholder rect with a type label (or later extend to extract a video first frame) |
+| `config` | Generation-config node, no visual semantics. **Skipped** by default |
+| `group` | Expanded into member nodes; not drawn itself |
+| Plugin nodes | Route A cannot render their custom DOM. Skipped by default, with skipped IDs recorded in the return value |
+
+Nodes whose image fails to load, or with `status === "error"` / `status === "loading"`: skip them rather than failing the whole rasterization.
+
+**Step 6 — output**
+
+```ts
+return {
+    dataUrl: canvas.toDataURL("image/png"),
+    width: canvas.width,
+    height: canvas.height,
+    nodeIds: renderedIds,
+    bounds,
+};
+```
+
+## Caller integration points
+
+### Primary scenario: multi-select nodes → AI edit
+
+In `web/src/pages/canvas/project.tsx`, the existing `annotateEditImageNode` already demonstrates the full "reference image → `requestEdit` → new child node" chain:
+
+```ts
+// existing implementation (annotation editing), usable as a template for new scenarios
+const annotatedReference = { id: `${node.id}-annotated`, name: "annotated.png", type: "image/png", dataUrl: payload.annotatedDataUrl };
+const image = await requestEdit(generationConfig, prompt, [annotatedReference], undefined, { signal: controller.signal }).then((items) => items[0]);
+```
+
+A new scenario only needs to swap `payload.annotatedDataUrl` for the output of `rasterizeCanvasSelection()`; everything else (model resolution, child node creation, connections, error handling) reuses existing code.
+
+Use for the `bounds` field: newly generated nodes can be placed to the right of the selection (`bounds.x + bounds.width + gap`), keeping the same feel as the existing `node.position.x + node.width + 96` placement in `annotateEditImageNode`.
+
+### Prompt pairing
+
+Cowart's core lesson is that rasterization **only works when paired with prompt guidance**. This project already has a matching i18n template to model after:
+
+```ts
+// web/src/i18n/locales/en-US.ts
+annotatePrompt: "Edit the image according to the arrow annotations. The output image must not retain any annotation artifacts: colored arrow lines and arrowheads, the number or text label near an arrow's tail, and the dashed blue selection ring. The rest of the image should stay unchanged. {{prompt}}"
+```
+
+The multi-node selection scenario needs a new template key of the same shape, telling the model explicitly: the reference image contains multiple picture elements and connections, how to interpret their relationships, and whether connection artifacts should be kept in the output. **Exact wording to be decided at implementation time**; the principle is to enumerate the visual elements to remove, as `annotatePrompt` does.
+
+## Open questions
+
+Each needs verification or a decision before implementation; this proposal does not presume answers:
+
+1. **Connection rendering parameters** — verify the real color, thickness, endpoint positions, and arrowhead behavior of the on-canvas connection components so rasterized output matches.
+2. **Text node fidelity** — text nodes render as DOM on canvas (fonts, line height, auto-wrap). Hand-drawing text in Canvas 2D is hard to match 1:1; decide how much divergence is acceptable, or skip text nodes too.
+3. **video / audio nodes** — placeholder rect, extract a video first frame (extra work), or skip entirely.
+4. **Plugin nodes** — confirm whether skipping is acceptable; if not, `CanvasNodeDefinition` may need an optional "rasterization hook" so plugins can supply their own thumbnail.
+5. **Whether to refactor annotation editing onto this function** — see below.
+6. **Entry-point UI for multi-select** — where it is triggered from (context menu / toolbar button / agent tool). This proposal only provides the underlying capability, not UI design.
+
+## Optional follow-ups
+
+- **Refactor annotation editing to reuse the general function** — `buildAnnotatedImage` overlaps with this proposal (both do offscreen compositing). Once the general function is stable, annotation editing could be rewritten as "`rasterizeCanvasSelection` for the base image + annotation canvas overlay", reducing duplication. But annotation editing has dedicated logic such as the padded margin (`PADDING_RATIO = 0.4`), so the refactor needs care and **should not be bundled with this proposal**.
+- **Route B as a high-fidelity fallback** — if real usage shows plugin/text node divergence is unacceptable, introduce `html-to-image` as an optional path so callers can choose "fast deterministic compositing" or "high-fidelity screenshot".
+- **Agent tool integration** — Cowart's `export_selection_reference` is an agent tool. This project already has `web/src/lib/agent/agent-site-tools.ts`, so this function could in principle be exposed to the agent panel. That is an **independent architectural decision** (whether agents should drive image generation), unrelated to the rasterization capability itself, and needs separate evaluation.
+
+## Verification plan
+
+Post-implementation coverage should include:
+
+1. `npm run typecheck` + `npm run build` pass with no errors.
+2. Single-node selection: output matches that node's original image (including padding and background).
+3. Multi-node selection: relative node positions match the canvas; connections drawn correctly.
+4. Mixed-type selection: images drawn, config nodes skipped, skipped IDs present in the return value.
+5. Edge cases: empty selection returns `null`; a node whose image fails to load is skipped without failing the whole call; `pixelRatio` takes effect (output pixel size = bounds × ratio).
+6. After AI-edit integration: verify the reference image sent to the model is correct (inspect the `image` field of the request FormData in the network panel).

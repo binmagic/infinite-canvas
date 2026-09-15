@@ -5,6 +5,7 @@
   "pages": [
     "local-development",
     "canvas-data-structure",
+    "canvas-selection-rasterize",
     "local-codex-canvas"
   ]
 }
